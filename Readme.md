@@ -7,4 +7,4 @@
 =========================================================================================
 
 ABOUT
-This is a project for non-Roscomnadzor block of information.
+This is a project for non-Roscomnadzor block in Russia.
