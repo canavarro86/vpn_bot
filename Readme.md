@@ -1,5 +1,5 @@
 # HideWay VPN + Telegram Bot
-Telegram: @HideWay_VPN_Bot
+# Telegram: **@HideWay_VPN_Bot**
 
 **HideWay** — это инфраструктура, позволяющая предоставлять бесплатные и в перспективе платные VPN-соединения пользователям через Telegram-бота.
 
@@ -37,8 +37,11 @@ Telegram: @HideWay_VPN_Bot
 /opt/tg_bot/
   ├─ bot.py                  # Код Telegram-бота (написать позже)
   ├─ generate_user_config.sh # Скрипт генерации ovpn
+  ├─ clean_ovpn.sh           # Скрипт для очистки ovpn от "мусора"
   ├─ base/
   │   └─ vpn_users.db        # SQLite-база данных
+  |       └─ users           # Таблица VPN-пользователей
+  |       └─ trafic          # Таблица остатка трафика
   └─ logs/                   # Логи работы бота
 4. Установка и настройка
 4.1 OpenSSH
