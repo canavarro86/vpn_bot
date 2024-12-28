@@ -1,4 +1,5 @@
 # HideWay VPN + Telegram Bot
+Telegram: @HideWay_VPN_Bot
 
 **HideWay** — это инфраструктура, позволяющая предоставлять бесплатные и в перспективе платные VPN-соединения пользователям через Telegram-бота.
 
