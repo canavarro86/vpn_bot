@@ -14,7 +14,7 @@ CA="$EASYRSA_DIR/pki/ca.crt"
 CERT="$EASYRSA_DIR/pki/issued/$USERNAME.crt"
 KEY="$EASYRSA_DIR/pki/private/$USERNAME.key"
 REQ="$EASYRSA_DIR/pki/reqs/$USERNAME.req"
-TA="/etc/openvpn/server/ta.key"
+TA="/etc/openvpn/server/tc.key"
 CONFIG_DIR="/etc/openvpn/client"
 OUTPUT="$CONFIG_DIR/$USERNAME.ovpn"
 
@@ -62,10 +62,10 @@ $(sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' "$CERT")
 <key>
 $(cat "$KEY")
 </key>
-<tls-auth>
+<tls-crypt>
 $(cat "$TA")
-</tls-auth>
-key-direction 1
+</tls-crypt>
+#key-direction 1
 EOF
 
 echo "Configuration file created at $OUTPUT"
