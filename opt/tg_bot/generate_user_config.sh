@@ -1,49 +1,72 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-CLIENT_NAME=$1
-OUTPUT_DIR="/etc/openvpn/clients_configs"
+USERNAME="$1"
+if [ -z "$USERNAME" ]; then
+  echo "Usage: $0 <username>"
+  exit 1
+fi
+
+echo "Generating certificates for $USERNAME..."
+
+# Пути к файлам
 EASYRSA_DIR="/etc/openvpn/server/easy-rsa"
-TEMPLATE="/etc/openvpn/client-template.ovpn"
+CA="$EASYRSA_DIR/pki/ca.crt"
+CERT="$EASYRSA_DIR/pki/issued/$USERNAME.crt"
+KEY="$EASYRSA_DIR/pki/private/$USERNAME.key"
+REQ="$EASYRSA_DIR/pki/reqs/$USERNAME.req"
+TA="/etc/openvpn/server/ta.key"
+CONFIG_DIR="/etc/openvpn/client"
+OUTPUT="$CONFIG_DIR/$USERNAME.ovpn"
 
-if [ -z "$CLIENT_NAME" ]; then
-    echo "Usage: $0 <client_name>"
+# Проверка существования сертификатов
+if [ -f "$KEY" ] || [ -f "$CERT" ]; then
+  echo "Certificates for $USERNAME already exist. Removing existing certificates..."
+  cd "$EASYRSA_DIR" || exit 1
+  echo yes | ./easyrsa revoke "$USERNAME"
+  ./easyrsa gen-crl
+  rm -f "$KEY" "$CERT" "$REQ"
+  echo "Existing certificates removed."
+fi
+
+# Генерация сертификатов
+cd "$EASYRSA_DIR" || exit 1
+echo yes | ./easyrsa build-client-full "$USERNAME" nopass
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to generate certificates for $USERNAME"
     exit 1
 fi
 
-# Генерация клиентских сертификатов и ключей, если их нет
-if [ ! -f "$EASYRSA_DIR/pki/issued/$CLIENT_NAME.crt" ] || [ ! -f "$EASYRSA_DIR/pki/private/$CLIENT_NAME.key" ]; then
-    echo "Клиентские сертификаты и ключи отсутствуют. Генерация новых..."
-    cd $EASYRSA_DIR
-    ./easyrsa build-client-full $CLIENT_NAME nopass
-    if [ $? -ne 0 ]; then
-        echo "Ошибка при генерации сертификатов клиента."
-        exit 1
-    fi
-    echo "Сертификаты и ключи для клиента $CLIENT_NAME успешно сгенерированы."
-fi
+mkdir -p "$CONFIG_DIR"
 
-# Проверка наличия необходимых файлов
-if [ ! -f "$EASYRSA_DIR/pki/ca.crt" ] || [ ! -f "$EASYRSA_DIR/pki/issued/$CLIENT_NAME.crt" ] || [ ! -f "$EASYRSA_DIR/pki/private/$CLIENT_NAME.key" ] || [ ! -f "/etc/openvpn/ta.key" ]; then
-    echo "Ошибка: Отсутствуют необходимые файлы (CA, client certificates, или ta.key)."
-    exit 1
-fi
+# Создаем конфигурационный файл
+cat > "$OUTPUT" <<EOF
+client
+dev tun
+proto udp
+remote 45.76.38.87 1194
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+auth SHA512
+ignore-unknown-option block-outside-dns
+verb 3
 
-# Чтение содержимого сертификатов и ключей
-CA_CERT=$(cat $EASYRSA_DIR/pki/ca.crt)
-CLIENT_CERT=$(cat $EASYRSA_DIR/pki/issued/$CLIENT_NAME.crt)
-CLIENT_KEY=$(cat $EASYRSA_DIR/pki/private/$CLIENT_NAME.key)
-TLS_AUTH=$(cat /etc/openvpn/ta.key)
+<ca>
+$(cat "$CA")
+</ca>
+<cert>
+$(sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' "$CERT")
+</cert>
+<key>
+$(cat "$KEY")
+</key>
+<tls-auth>
+$(cat "$TA")
+</tls-auth>
+key-direction 1
+EOF
 
-# Заменяем плейсхолдеры в шаблоне
-CONFIG=$(cat $TEMPLATE)
-CONFIG=${CONFIG//"{ca_cert}"/"$CA_CERT"}
-CONFIG=${CONFIG//"{client_cert}"/"$CLIENT_CERT"}
-CONFIG=${CONFIG//"{client_key}"/"$CLIENT_KEY"}
-CONFIG=${CONFIG//"{tls_auth}"/"$TLS_AUTH"}
-
-# Сохраняем конфигурационный файл
-OUTPUT_FILE="$OUTPUT_DIR/$CLIENT_NAME.ovpn"
-mkdir -p $OUTPUT_DIR
-echo "$CONFIG" > $OUTPUT_FILE
-
-echo "Конфигурационный файл создан: $OUTPUT_FILE"
+echo "Configuration file created at $OUTPUT"
+exit 0
