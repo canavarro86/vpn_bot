@@ -1,0 +1,26 @@
+# Secrets
+.env
+*.env
+!.env.example
+
+# Runtime data — НИКОГДА не коммитим базу пользователей, банов, трафика
+data/
+*.json.bak.*
+*.jsonl
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Backups
+backup/
+*.tar.gz
+*.tmp.*
+
+# OS / editor
+.DS_Store
+.vscode/
+*.swp
