@@ -1,8 +1,0 @@
-#.gitignore
-tech/tz.docx
-opt/tg-bot/.env
-
-# Игнорируем каталоги:
-base/
-old/
-venv/
