@@ -35,8 +35,8 @@ jobs:
 
             # 1Schema is applied on boot by repo.init_schema() (idempotent,
             # CREATE TABLE IF NOT EXISTS). No manual sqlite step needed.
-            sudo systemctl restart hideway-bot
-            sudo systemctl --no-pager --lines=0 status hideway-bot
+            sudo /usr/bin/systemctl restart hideway-bot
+            sudo /usr/bin/systemctl --no-pager --lines=0 status hideway-bot
 
             # --- Health checks (fail deploy on any miss) ---
             sleep 5
