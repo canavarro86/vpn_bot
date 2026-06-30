@@ -33,7 +33,7 @@ jobs:
             # venv must exist on server: python3 -m venv /opt/vpn_bot/venv
             ./venv/bin/pip install -q --upgrade -r requirements.txt
 
-            # Schema is applied on boot by repo.init_schema() (idempotent,
+            # 1Schema is applied on boot by repo.init_schema() (idempotent,
             # CREATE TABLE IF NOT EXISTS). No manual sqlite step needed.
             sudo systemctl restart hideway-bot
             sudo systemctl --no-pager --lines=0 status hideway-bot
