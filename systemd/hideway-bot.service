@@ -1,0 +1,23 @@
+[Unit]
+Description=HideWay VPN Telegram bot
+Documentation=https://github.com/  # repo URL
+# Xray must be up first: bot rewrites its config + `systemctl reload xray`.
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root: bot writes /usr/local/etc/xray/config.json and calls
+# `systemctl reload xray`. Switch to a dedicated user only with matching
+# sudoers + file ownership for the Xray config.
+WorkingDirectory=/opt/vpn_bot
+# App loads .env from WorkingDirectory via python-dotenv (config.load_settings).
+ExecStart=/opt/vpn_bot/venv/bin/python -m src.bot
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hideway-bot
+
+[Install]
+WantedBy=multi-user.target
