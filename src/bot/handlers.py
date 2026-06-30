@@ -124,8 +124,19 @@ async def revoke_user(repo: Repository, settings: Settings, user: User, reason: 
     )
 
 
+# статусы, которым разрешена выдача VPN. under_approve ждёт ручного апрува,
+# banned — забанен; обоим клиент не выдаём (ТЗ задача 1).
+_PROVISIONABLE = (repo_mod.STATUS_PENDING, repo_mod.STATUS_ACTIVE, repo_mod.STATUS_REVOKED)
+
+
 async def activate_free(bot: Bot, repo: Repository, settings: Settings, telegram_id: int):
-    """Проверяет подписку и при успехе выдаёт клиента. Возвращает (ok, access_url|None)."""
+    """Проверяет подписку и при успехе выдаёт клиента. Возвращает (ok, access_url|None).
+
+    Не выдаёт VPN, если статус не из _PROVISIONABLE (under_approve/banned) —
+    мигрированные ждут /admin_approve, забаненные не обслуживаются."""
+    user = await asyncio.to_thread(repo.get_user, telegram_id)
+    if user is not None and user.status not in _PROVISIONABLE:
+        return False, None
     if not await is_subscribed(bot, settings, telegram_id):
         await asyncio.to_thread(repo.set_status, telegram_id, repo_mod.STATUS_PENDING)
         return False, None
@@ -175,6 +186,15 @@ async def cmd_start(message: Message, bot: Bot, repo: Repository, settings: Sett
         await asyncio.to_thread(
             repo.upsert_user, tid, username, user.status, user.tier, None
         )
+
+    # мигрированные из legacy ждут ручного апрува — не зовём в подписку
+    if user is not None and user.status == repo_mod.STATUS_UNDER_APPROVE:
+        await message.answer(
+            "👋 <b>HideWay VPN</b>\n\n"
+            "Ваша заявка на доступ получена и ожидает подтверждения администратора. "
+            "Как только её одобрят, вы сможете получить ссылку командой /get."
+        )
+        return
 
     await message.answer(
         "👋 <b>HideWay VPN</b>\n\n"
@@ -231,6 +251,9 @@ async def cmd_get(message: Message, bot: Bot, repo: Repository, settings: Settin
         return
     if user.status == repo_mod.STATUS_ACTIVE and user.access_url:
         await _send_link(message, user.access_url)
+        return
+    if user.status == repo_mod.STATUS_UNDER_APPROVE:
+        await message.answer("⏳ Ваша заявка ещё не подтверждена администратором.")
         return
     # не активен — пробуем активировать (вдруг уже подписан)
     ok, url = await activate_free(bot, repo, settings, message.from_user.id)

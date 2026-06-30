@@ -33,7 +33,15 @@ jobs:
             # venv must exist on server: python3 -m venv /opt/vpn_bot/venv
             ./venv/bin/pip install -q --upgrade -r requirements.txt
 
-            # 1Schema is applied on boot by repo.init_schema() (idempotent,
+            # One-time legacy migration. Runs as hidewaybot (owns data/).
+            # Self-guards: skips if users table non-empty (idempotent), so
+            # repeat deploys no-op. || true keeps deploy green either way.
+            sudo -u hidewaybot ./venv/bin/python scripts/migrate_legacy_json.py \
+              --data-dir /opt/vpn_bot/DB_ARH \
+              --db /opt/vpn_bot/data/hideway.db \
+              --apply || true
+
+            # Schema is applied on boot by repo.init_schema() (idempotent,
             # CREATE TABLE IF NOT EXISTS). No manual sqlite step needed.
             sudo /usr/bin/systemctl restart hideway-bot
             sudo /usr/bin/systemctl --no-pager --lines=0 status hideway-bot
@@ -53,10 +61,12 @@ jobs:
               exit 1
             fi
 
-            # 3. DB accessible
+            # 3. DB accessible + report user count (post-migration)
             if ! python3 -c "import sqlite3; sqlite3.connect('/opt/vpn_bot/data/hideway.db').execute('SELECT 1')"; then
               echo "❌ DB not accessible"
               exit 1
             fi
+            USERS=$(python3 -c "import sqlite3; print(sqlite3.connect('/opt/vpn_bot/data/hideway.db').execute('SELECT COUNT(*) FROM users').fetchone()[0])")
+            echo "👥 users in DB: $USERS"
 
             echo "✅ Deploy OK"

@@ -4,7 +4,7 @@
 CREATE TABLE IF NOT EXISTS users (
     telegram_id        INTEGER PRIMARY KEY,
     username           TEXT,
-    status             TEXT NOT NULL,                 -- pending_subscription | active | revoked | banned
+    status             TEXT NOT NULL,                 -- pending_subscription | active | revoked | banned | under_approve
     tier               TEXT NOT NULL DEFAULT 'free',  -- free | paid
     vpn_client_id      TEXT,                          -- UUID клиента в Xray
     access_url         TEXT,                          -- vless://... ссылка для импорта

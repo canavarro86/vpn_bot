@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
-"""Одноразовая миграция legacy JSON → новая SQLite (ТЗ раздел 6).
+"""Одноразовая миграция legacy JSON → новая SQLite (ТЗ задача 2).
 
 Переносится ТОЛЬКО факт существования пользователя / статус / тариф / баны.
-Старые Outline-ключи НЕ переносятся — движок другой, VPN-клиент создаётся
-заново через vpn_engine при следующем /get.
+Старые Outline-ключи (ss://) НЕ переносятся — движок другой, VPN-клиент
+создаётся заново через vpn_engine при следующем /get после апрува.
 
 Источники в DATA_DIR:
-  - outline_keys.json  → пользователи со статусом active, tier free
-  - pending_ids.json   → 140 id со статусом pending_subscription (БЕЗ сообщений)
-  - bans.json          → таблица bans + статус banned
+  - outline_keys.json  → формат {"users": {"<id>": {...}}}
+      * owner_user_id == ADMIN (1393616622) → status active, tier free (владелец)
+      * остальные                           → status under_approve (ждут апрува)
+  - bans.json          → формат {"<id>": {"until": <ts|0>, "last":..., "viol":[...]}}
+      * until == 0  → permanent ban (expires_at = NULL)
+      * until > 0   → expires_at = until
+      * забаненного создаём в users со статусом banned, если его нет
 
-Идемпотентно: повторный запуск не плодит дубли и не понижает active→pending.
+traffic_state.json и audit.log.jsonl НЕ мигрируются (ТЗ 2.3).
+
+Идемпотентность (ТЗ 2.4): если в users уже есть строки — миграция пропускается
+(exit 0). Так миграция отрабатывает один раз; повторные деплои её не трогают.
+
 По умолчанию --dry-run (только показывает план). Реальная запись: --apply.
 
 Запуск:
-    python -m scripts.migrate_legacy_json --apply
-    python -m scripts.migrate_legacy_json --data-dir ./data --db ./data/hideway.db --dry-run
+    python scripts/migrate_legacy_json.py --apply
+    python scripts/migrate_legacy_json.py --data-dir ./DB_ARH --db /tmp/test.db --apply
 """
 
 from __future__ import annotations
@@ -33,9 +41,12 @@ from src.db.repository import (  # noqa: E402
     Repository,
     STATUS_ACTIVE,
     STATUS_BANNED,
-    STATUS_PENDING,
+    STATUS_UNDER_APPROVE,
     TIER_FREE,
 )
+
+ADMIN_ID = 1393616622
+BAN_REASON = "migrated from legacy bans.json"
 
 
 def _load_json(path: Path):
@@ -47,6 +58,16 @@ def _load_json(path: Path):
     except json.JSONDecodeError as e:
         print(f"  ! {path.name}: невалидный JSON ({e}) — пропуск")
         return None
+
+
+def _unwrap_users(data):
+    """Разворачивает обёртку {"users": {...}} legacy outline_keys.json.
+    Если ключа "users" нет — возвращает data как есть."""
+    if isinstance(data, dict) and set(data.keys()) == {"users"} and isinstance(
+        data["users"], dict
+    ):
+        return data["users"]
+    return data
 
 
 def _iter_ids_with_meta(data):
@@ -84,66 +105,71 @@ def _iter_ids_with_meta(data):
                     continue
 
 
-def migrate(data_dir: Path, db_path: Path, apply: bool) -> None:
+def migrate(data_dir: Path, db_path: Path, apply: bool) -> int:
     repo = Repository(db_path)
     repo.init_schema()
 
-    plan = {"active": 0, "pending": 0, "banned": 0, "skipped_existing": 0}
+    # --- Идемпотентность (ТЗ 2.4): непустая БД → не трогаем ---
+    existing_count = repo.count_users()
+    if existing_count > 0:
+        print(f"DB already populated ({existing_count} users), skipping migration")
+        repo.close()
+        return 0
 
-    # 1) outline_keys.json → active/free
-    print("outline_keys.json → active users:")
-    keys_data = _load_json(data_dir / "outline_keys.json")
+    # Итоговый статус каждого id считаем в памяти (bans перекрывают outline),
+    # чтобы план dry-run и --apply давали одинаковые цифры независимо от записи.
+    final_status: dict[int, str] = {}
+    usernames: dict[int, str | None] = {}
+    ban_rows: dict[int, int | None] = {}  # tid → expires_at (None=permanent)
+
+    # 1) outline_keys.json → active (админ) / under_approve (остальные)
+    print("outline_keys.json → active(admin) / under_approve:")
+    keys_data = _unwrap_users(_load_json(data_dir / "outline_keys.json"))
     for tid, meta in _iter_ids_with_meta(keys_data):
-        username = meta.get("username")
-        existing = repo.get_user(tid)
-        if existing and existing.status == STATUS_ACTIVE:
-            plan["skipped_existing"] += 1
-            continue
-        plan["active"] += 1
-        if apply:
-            repo.upsert_user(tid, username, STATUS_ACTIVE, TIER_FREE)
-            repo.audit("migrated_active", telegram_id=tid, details={"source": "outline_keys.json"})
+        owner = meta.get("owner_user_id", tid)
+        final_status[tid] = STATUS_ACTIVE if owner == ADMIN_ID else STATUS_UNDER_APPROVE
+        usernames[tid] = meta.get("username")
 
-    # 2) pending_ids.json → pending_subscription (не понижаем уже active)
-    print("pending_ids.json → pending_subscription:")
-    pending_data = _load_json(data_dir / "pending_ids.json")
-    for tid, meta in _iter_ids_with_meta(pending_data):
-        existing = repo.get_user(tid)
-        if existing is not None:
-            plan["skipped_existing"] += 1
-            continue
-        plan["pending"] += 1
-        if apply:
-            repo.upsert_user(tid, meta.get("username"), STATUS_PENDING, TIER_FREE)
-            repo.audit("migrated_pending", telegram_id=tid, details={"source": "pending_ids.json"})
-
-    # 3) bans.json → bans + статус banned
+    # 2) bans.json → banned (перекрывает статус из outline_keys)
     print("bans.json → bans:")
     bans_data = _load_json(data_dir / "bans.json")
     for tid, meta in _iter_ids_with_meta(bans_data):
-        reason = meta.get("reason") if isinstance(meta, dict) else None
-        expires = meta.get("expires_at") if isinstance(meta, dict) else None
-        plan["banned"] += 1
-        if apply:
-            # пользователь обязан существовать для FK-чистоты статуса
-            if repo.get_user(tid) is None:
-                repo.upsert_user(tid, None, STATUS_BANNED, TIER_FREE)
-            else:
-                repo.set_status(tid, STATUS_BANNED)
-            repo.add_ban(tid, reason=reason, expires_at=expires)
-            repo.audit("migrated_ban", telegram_id=tid, details={"source": "bans.json"})
+        until = meta.get("until", 0) if isinstance(meta, dict) else 0
+        try:
+            until = int(until)
+        except (TypeError, ValueError):
+            until = 0
+        ban_rows[tid] = until if until > 0 else None  # 0 → permanent (NULL)
+        final_status[tid] = STATUS_BANNED
+        usernames.setdefault(tid, None)
 
+    # --- запись ---
+    if apply:
+        for tid, status in final_status.items():
+            # access_url (ss:// Outline) НЕ переносим — другой движок
+            repo.upsert_user(tid, usernames.get(tid), status, TIER_FREE)
+            repo.audit("migrated_user", telegram_id=tid, details={"status": status})
+        for tid, expires in ban_rows.items():
+            repo.add_ban(tid, reason=BAN_REASON, expires_at=expires)
+            repo.audit("migrated_ban", telegram_id=tid, details={"expires_at": expires})
+
+    counts = {STATUS_ACTIVE: 0, STATUS_UNDER_APPROVE: 0, STATUS_BANNED: 0}
+    for status in final_status.values():
+        counts[status] = counts.get(status, 0) + 1
+    perm_bans = sum(1 for e in ban_rows.values() if e is None)
+    final_users = repo.count_users() if apply else len(final_status)
     repo.close()
 
     mode = "APPLIED" if apply else "DRY-RUN (ничего не записано, добавь --apply)"
     print("\n=== %s ===" % mode)
-    print(f"  active(new/updated): {plan['active']}")
-    print(f"  pending(new):        {plan['pending']}")
-    print(f"  banned:              {plan['banned']}")
-    print(f"  skipped(existing):   {plan['skipped_existing']}")
+    print(f"  active:        {counts[STATUS_ACTIVE]}")
+    print(f"  under_approve: {counts[STATUS_UNDER_APPROVE]}")
+    print(f"  banned:        {counts[STATUS_BANNED]} (permanent: {perm_bans})")
+    print(f"  users total:   {final_users}")
+    return 0
 
 
-def main() -> None:
+def main() -> int:
     p = argparse.ArgumentParser(description="Миграция legacy JSON → SQLite")
     p.add_argument("--data-dir", default=None, help="каталог с legacy JSON (по умолч. из .env DATA_DIR)")
     p.add_argument("--db", default=None, help="путь к hideway.db (по умолч. DATA_DIR/hideway.db)")
@@ -159,8 +185,8 @@ def main() -> None:
     db_path = Path(args.db) if args.db else data_dir / "hideway.db"
     print(f"data_dir = {data_dir}")
     print(f"db       = {db_path}\n")
-    migrate(data_dir, db_path, apply=args.apply)
+    return migrate(data_dir, db_path, apply=args.apply)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

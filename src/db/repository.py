@@ -25,6 +25,9 @@ STATUS_PENDING = "pending_subscription"
 STATUS_ACTIVE = "active"
 STATUS_REVOKED = "revoked"
 STATUS_BANNED = "banned"
+# under_approve — мигрированный из legacy юзер, ждёт ручного апрува админом
+# (/admin_approve → pending_subscription). VPN не выдаётся до апрува.
+STATUS_UNDER_APPROVE = "under_approve"
 
 TIER_FREE = "free"
 TIER_PAID = "paid"
@@ -199,6 +202,66 @@ class Repository:
             "SELECT * FROM users WHERE status = ? ORDER BY created_at", (status,)
         ).fetchall()
         return [User.from_row(r) for r in rows]
+
+    def count_users(self, status: Optional[str] = None) -> int:
+        if status is None:
+            row = self._conn.execute("SELECT COUNT(*) c FROM users").fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) c FROM users WHERE status = ?", (status,)
+            ).fetchone()
+        return int(row["c"])
+
+    def list_all_users(
+        self, status: Optional[str] = None, limit: int = 30, offset: int = 0
+    ) -> list[User]:
+        """Постранично все пользователи (для /admin_list). Сорт по created_at."""
+        if status is None:
+            rows = self._conn.execute(
+                "SELECT * FROM users ORDER BY created_at LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM users WHERE status = ? ORDER BY created_at LIMIT ? OFFSET ?",
+                (status, limit, offset),
+            ).fetchall()
+        return [User.from_row(r) for r in rows]
+
+    def delete_user(self, telegram_id: int) -> bool:
+        """Полное удаление юзера + зависимых записей (payments, connection_log,
+        bans). audit_log сохраняется (telegram_id остаётся как историческая
+        ссылка). Возвращает True, если юзер существовал. Транзакция: дочерние
+        строки удаляются перед родителем (FK ON)."""
+        existing = self.get_user(telegram_id)
+        with self._tx() as cur:
+            cur.execute("DELETE FROM payments WHERE telegram_id = ?", (telegram_id,))
+            cur.execute("DELETE FROM connection_log WHERE telegram_id = ?", (telegram_id,))
+            cur.execute("DELETE FROM bans WHERE telegram_id = ?", (telegram_id,))
+            cur.execute("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
+        return existing is not None
+
+    def traffic_top(self, limit: int = 10) -> list[User]:
+        rows = self._conn.execute(
+            "SELECT * FROM users ORDER BY traffic_used_bytes DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [User.from_row(r) for r in rows]
+
+    def paid_summary(self, as_of: Optional[int] = None) -> dict[str, Any]:
+        """Сводка по активным paid-подпискам: число активных и сумма
+        оставшихся оплаченных дней."""
+        cutoff = as_of if as_of is not None else now_ts()
+        row = self._conn.execute(
+            """SELECT COUNT(*) c,
+                      COALESCE(SUM(paid_until - ?), 0) remaining_seconds
+               FROM users
+               WHERE tier = ? AND paid_until IS NOT NULL AND paid_until > ?""",
+            (cutoff, TIER_PAID, cutoff),
+        ).fetchone()
+        return {
+            "active_paid": int(row["c"]),
+            "remaining_days": int(row["remaining_seconds"]) // 86400,
+        }
 
     def list_active_with_client(self) -> list[User]:
         rows = self._conn.execute(
