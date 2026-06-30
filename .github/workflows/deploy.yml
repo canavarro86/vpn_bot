@@ -37,3 +37,26 @@ jobs:
             # CREATE TABLE IF NOT EXISTS). No manual sqlite step needed.
             sudo systemctl restart hideway-bot
             sudo systemctl --no-pager --lines=0 status hideway-bot
+
+            # --- Health checks (fail deploy on any miss) ---
+            sleep 5
+
+            # 1. Service active
+            if [ "$(systemctl is-active hideway-bot)" != "active" ]; then
+              echo "❌ hideway-bot not active"
+              exit 1
+            fi
+
+            # 2. Bot reached polling
+            if ! journalctl -u hideway-bot -n 5 --no-pager | grep -q "polling"; then
+              echo "❌ 'polling' not found in recent logs"
+              exit 1
+            fi
+
+            # 3. DB accessible
+            if ! python3 -c "import sqlite3; sqlite3.connect('/opt/vpn_bot/data/hideway.db').execute('SELECT 1')"; then
+              echo "❌ DB not accessible"
+              exit 1
+            fi
+
+            echo "✅ Deploy OK"
