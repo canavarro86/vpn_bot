@@ -281,7 +281,7 @@ class Repository:
 
     def stats_counts(self) -> dict[str, Any]:
         """Сводка для /admin_stats: разбивка по статусам и тарифам + суммарный трафик."""
-        out: dict[str, Any] = {"by_status": {}, "by_tier": {}}
+        out: dict[str, Any] = {"by_status": {}, "by_tier": {}, "db_path": str(self.db_path)}
         for row in self._conn.execute(
             "SELECT status, COUNT(*) c FROM users GROUP BY status"
         ):
@@ -294,6 +294,7 @@ class Repository:
             "SELECT COALESCE(SUM(traffic_used_bytes),0) t FROM users"
         ).fetchone()["t"]
         out["total_traffic_bytes"] = total
+        out["total_users"] = sum(out["by_status"].values())
         return out
 
     # ---------- payments ----------

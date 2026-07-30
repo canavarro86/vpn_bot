@@ -30,6 +30,17 @@ router = Router(name="admin")
 GB = 1_000_000_000
 PAGE_SIZE = 25  # юзеров на страницу /admin_list (Telegram лимит ~4096 символов)
 
+# (подпись в /admin_stats, значение колонки users.status) — берём из констант
+# репозитория, чтобы строка статуса не расходилась с тем, что пишется в БД
+_STATUS_ROWS = (
+    ("active", repo_mod.STATUS_ACTIVE),
+    ("pending", repo_mod.STATUS_PENDING),
+    ("under_approve", repo_mod.STATUS_UNDER_APPROVE),
+    ("revoked", repo_mod.STATUS_REVOKED),
+    ("banned", repo_mod.STATUS_BANNED),
+)
+_KNOWN_STATUSES = {key for _, key in _STATUS_ROWS}
+
 
 class IsAdmin(BaseFilter):
     async def __call__(self, message: Message, settings: Settings) -> bool:
@@ -64,17 +75,22 @@ async def admin_stats(message: Message, repo: Repository) -> None:
     by_status = st["by_status"]
     by_tier = st["by_tier"]
     total_gb = st["total_traffic_bytes"] / GB
-    text = (
-        f"<b>📊 Статистика</b> <i>(v{__version__})</i>\n\n"
-        f"active: {by_status.get('active', 0)}\n"
-        f"pending: {by_status.get('pending_subscription', 0)}\n"
-        f"under_approve: {by_status.get('under_approve', 0)}\n"
-        f"revoked: {by_status.get('revoked', 0)}\n"
-        f"banned: {by_status.get('banned', 0)}\n\n"
-        f"free: {by_tier.get('free', 0)} | paid: {by_tier.get('paid', 0)}\n\n"
-        f"Суммарный трафик: {total_gb:.2f} GB"
-    )
-    await message.answer(text)
+
+    lines = [f"<b>📊 Статистика</b> <i>(v{__version__})</i>", ""]
+    lines += [f"{label}: {by_status.get(key, 0)}" for label, key in _STATUS_ROWS]
+    # статусы из БД, которых нет в _STATUS_ROWS — иначе юзеры молча исчезают из сводки
+    for status, count in sorted(by_status.items()):
+        if status not in _KNOWN_STATUSES:
+            lines.append(f"{status} (?): {count}")
+    lines += [
+        "",
+        f"всего юзеров: {st['total_users']}",
+        f"free: {by_tier.get('free', 0)} | paid: {by_tier.get('paid', 0)}",
+        "",
+        f"Суммарный трафик: {total_gb:.2f} GB",
+        f"<i>БД: {st['db_path']}</i>",
+    ]
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("admin_find"))
