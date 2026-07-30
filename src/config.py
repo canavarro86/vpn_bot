@@ -42,7 +42,7 @@ class Settings:
     required_channel_id: str = ""
 
     # === Storage ===
-    data_dir: Path = Path("/opt/hideway-bot/data")
+    data_dir: Path = Path("/opt/vpn_bot/data")
 
     # === VPN-движок (Xray) ===
     xray_config_path: Path = Path("/usr/local/etc/xray/config.json")
@@ -105,7 +105,7 @@ def load_settings(env_file: str | os.PathLike | None = ".env") -> Settings:
         telegram_bot_token=token,
         admin_user_ids=_parse_id_list(os.getenv("ADMIN_USER_IDS", "")),
         required_channel_id=os.getenv("REQUIRED_CHANNEL_ID", "").strip(),
-        data_dir=Path(os.getenv("DATA_DIR", "/opt/hideway-bot/data")),
+        data_dir=Path(os.getenv("DATA_DIR", "/opt/vpn_bot/data")),
         xray_config_path=Path(os.getenv("XRAY_CONFIG_PATH", "/usr/local/etc/xray/config.json")),
         xray_api_address=os.getenv("XRAY_API_ADDRESS", "127.0.0.1:10085").strip(),
         server_public_ip=os.getenv("SERVER_PUBLIC_IP", "").strip(),

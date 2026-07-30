@@ -50,6 +50,8 @@ async def _notify(bot: Bot, telegram_id: int, text: str) -> None:
 
 async def check_subscriptions(bot: Bot, repo: Repository, settings: Settings) -> None:
     """Ре-проверка подписки на канал: отписавшимся active-free → revoke."""
+    if not settings.required_channel_id:
+        return  # канал не настроен — не делать ложных отзывов
     users = await asyncio.to_thread(repo.list_active_with_client)
     for u in users:
         if u.tier == repo_mod.TIER_PAID:

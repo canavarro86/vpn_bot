@@ -33,7 +33,10 @@ PAGE_SIZE = 25  # юзеров на страницу /admin_list (Telegram ли�
 
 class IsAdmin(BaseFilter):
     async def __call__(self, message: Message, settings: Settings) -> bool:
-        return message.from_user is not None and settings.is_admin(message.from_user.id)
+        user_id = message.from_user.id if message.from_user else None
+        is_admin = user_id is not None and settings.is_admin(user_id)
+        log.info("admin command %s from %s, is_admin=%s", message.text, user_id, is_admin)
+        return is_admin
 
 
 # фильтр на весь роутер — ни один admin-хендлер не сработает для не-админа
@@ -346,7 +349,13 @@ async def admin_stats_full(message: Message, repo: Repository) -> None:
 
 
 @router.message(Command("admin_help"))
-async def admin_help(message: Message) -> None:
+async def admin_help(message: Message, settings: Settings) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    log.info(
+        "admin_help: telegram_id=%s is_admin=%s admin_user_ids=%s",
+        user_id, settings.is_admin(user_id) if user_id is not None else False,
+        settings.admin_user_ids,
+    )
     text = (
         f"<b>🛠 Админ-команды HideWay</b> <i>(v{__version__})</i>\n\n"
         "<code>/admin_stats</code> — сводка по статусам/тарифам/трафику\n"

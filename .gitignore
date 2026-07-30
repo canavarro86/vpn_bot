@@ -36,3 +36,6 @@ backup/
 .DS_Store
 .vscode/
 *.swp
+
+# Claude
+.claude

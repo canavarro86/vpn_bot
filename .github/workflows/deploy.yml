@@ -1,0 +1,66 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /opt/vpn_bot
+
+            # Tracked files only. data/, .env, xray config, venv/, DB_ARH/ are
+            # gitignored / outside repo -> untouched by reset --hard.
+            git fetch --prune origin
+            git reset --hard origin/main
+
+            ./venv/bin/pip install -q --upgrade -r requirements.txt
+
+            # Idempotent legacy migration. Never fails the deploy: a bad run
+            # here must not block shipping code, DB state is fixed separately.
+            sudo -u hidewaybot ./venv/bin/python scripts/migrate_legacy_json.py \
+              --data-dir /opt/vpn_bot/DB_ARH --db /opt/vpn_bot/data/hideway.db --apply || true
+
+            sudo /usr/bin/systemctl restart hideway-bot
+
+            sleep 8
+
+            # --- Health checks (fail deploy on any miss) ---
+
+            # 1. Service active
+            if [ "$(systemctl is-active hideway-bot)" != "active" ]; then
+              echo "❌ hideway-bot not active"
+              exit 1
+            fi
+
+            # 2. Bot actually restarted just now (fresh log line, not stale process)
+            last_log_epoch="$(journalctl -u hideway-bot -n 5 --no-pager -o short-unix | tail -1 | awk '{print $1}')"
+            now_epoch="$(date -u +%s)"
+            if [ -z "$last_log_epoch" ] || [ $((now_epoch - ${last_log_epoch%.*})) -gt 30 ]; then
+              echo "❌ no recent journal activity from hideway-bot (last: ${last_log_epoch:-none})"
+              exit 1
+            fi
+
+            # 3. DB reachable and has data
+            user_count="$(sqlite3 /opt/vpn_bot/data/hideway.db 'SELECT COUNT(*) FROM users;')"
+            if [ -z "$user_count" ] || [ "$user_count" -le 0 ]; then
+              echo "❌ users table empty or unreadable (count: ${user_count:-none})"
+              exit 1
+            fi
+
+            echo "✅ Deploy OK $(date -u)"

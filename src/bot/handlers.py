@@ -76,30 +76,32 @@ def _channel_chat_id(raw: str):
 async def is_subscribed(bot: Bot, settings: Settings, telegram_id: int) -> bool:
     """Подписан ли пользователь на REQUIRED_CHANNEL_ID.
 
-    Если канал не задан (плейсхолдер, ТЗ раздел 10) — НЕ блокируем: считаем
-    подписанным, чтобы бот работал до подстановки реального канала.
+    # TEMPORARILY DISABLED — bot not admin in channel yet.
+    # Free 5GB VPN granted without subscription check until the bot is made
+    # an admin in the channel and this is re-enabled.
     """
-    chat = _channel_chat_id(settings.required_channel_id)
-    if chat is None:
-        log.warning("REQUIRED_CHANNEL_ID не задан — пропускаю проверку подписки")
-        return True
-    try:
-        member = await bot.get_chat_member(chat, telegram_id)
-    except TelegramBadRequest as e:
-        # Fail-open on API errors (wrong channel ID, bot not admin, etc.).
-        # Returning False here would trigger mass revocations if the channel
-        # temporarily misbehaves. Users who actually left show up as
-        # ChatMemberStatus.LEFT without raising an exception.
-        log.warning(
-            "get_chat_member(%s, %s) API error — treating as subscribed (fail-open): %s",
-            chat, telegram_id, e.message,
-        )
-        return True
-    return member.status in (
-        ChatMemberStatus.MEMBER,
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.CREATOR,
-    )
+    return True
+    # chat = _channel_chat_id(settings.required_channel_id)
+    # if chat is None:
+    #     log.warning("REQUIRED_CHANNEL_ID не задан — пропускаю проверку подписки")
+    #     return True
+    # try:
+    #     member = await bot.get_chat_member(chat, telegram_id)
+    # except TelegramBadRequest as e:
+    #     # Fail-open on API errors (wrong channel ID, bot not admin, etc.).
+    #     # Returning False here would trigger mass revocations if the channel
+    #     # temporarily misbehaves. Users who actually left show up as
+    #     # ChatMemberStatus.LEFT without raising an exception.
+    #     log.warning(
+    #         "get_chat_member(%s, %s) API error — treating as subscribed (fail-open): %s",
+    #         chat, telegram_id, e.message,
+    #     )
+    #     return True
+    # return member.status in (
+    #     ChatMemberStatus.MEMBER,
+    #     ChatMemberStatus.ADMINISTRATOR,
+    #     ChatMemberStatus.CREATOR,
+    # )
 
 
 async def provision_client(repo: Repository, settings: Settings, telegram_id: int) -> str:
