@@ -3,10 +3,20 @@
 *.env
 !.env.example
 
+# Legacy JSON archive — real user data, never commit
+DB_ARH/
+
 # Runtime data — НИКОГДА не коммитим базу пользователей, банов, трафика
 data/
+*.db
+*.db-shm
+*.db-wal
 *.json.bak.*
 *.jsonl
+
+# Build artefacts
+*.zip
+.zip
 
 # Python
 venv/
@@ -14,6 +24,8 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.coverage
+htmlcov/
 
 # Backups
 backup/

@@ -108,13 +108,24 @@ async def admin_find(message: Message, command: CommandObject, repo: Repository)
 
 
 @router.message(Command("admin_ban"))
-async def admin_ban(message: Message, command: CommandObject, repo: Repository) -> None:
+async def admin_ban(
+    message: Message, command: CommandObject, repo: Repository, settings: Settings
+) -> None:
     parts = (command.args or "").split(maxsplit=1)
     tid = _parse_int(parts[0] if parts else None)
     if tid is None:
         await message.answer("Использование: <code>/admin_ban &lt;telegram_id&gt; [причина]</code>")
         return
     reason = parts[1] if len(parts) > 1 else "admin ban"
+    # Revoke the Xray client BEFORE writing the ban so the user loses VPN
+    # access immediately, not just on the next middleware check.
+    user = await asyncio.to_thread(repo.get_user, tid)
+    if user and user.vpn_client_id:
+        try:
+            await asyncio.to_thread(vpn_client.delete_client, user.vpn_client_id, settings)
+        except vpn_client.VpnEngineError as e:
+            log.error("admin_ban: delete_client(%s) не удался: %s", tid, e)
+        await asyncio.to_thread(repo.set_vpn_client, tid, None, None)
     await asyncio.to_thread(repo.add_ban, tid, reason, None)  # permanent
     await asyncio.to_thread(repo.set_status, tid, repo_mod.STATUS_BANNED)
     await asyncio.to_thread(repo.audit, "banned", tid, {"by": message.from_user.id, "reason": reason})

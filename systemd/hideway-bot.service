@@ -1,6 +1,6 @@
 [Unit]
 Description=HideWay VPN Telegram bot
-Documentation=https://github.com/  # repo URL
+Documentation=https://github.com/canavarro86/vpn_bot
 # Xray must be up first: bot rewrites its config + `systemctl reload xray`.
 After=network-online.target xray.service
 Wants=network-online.target

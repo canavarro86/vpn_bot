@@ -86,8 +86,15 @@ async def is_subscribed(bot: Bot, settings: Settings, telegram_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat, telegram_id)
     except TelegramBadRequest as e:
-        log.warning("get_chat_member(%s, %s) ошибка: %s", chat, telegram_id, e.message)
-        return False
+        # Fail-open on API errors (wrong channel ID, bot not admin, etc.).
+        # Returning False here would trigger mass revocations if the channel
+        # temporarily misbehaves. Users who actually left show up as
+        # ChatMemberStatus.LEFT without raising an exception.
+        log.warning(
+            "get_chat_member(%s, %s) API error — treating as subscribed (fail-open): %s",
+            chat, telegram_id, e.message,
+        )
+        return True
     return member.status in (
         ChatMemberStatus.MEMBER,
         ChatMemberStatus.ADMINISTRATOR,
