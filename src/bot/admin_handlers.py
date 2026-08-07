@@ -12,10 +12,15 @@ import asyncio
 import datetime as dt
 import logging
 
-from aiogram import Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import BaseFilter, Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from .. import __version__
 from ..config import Settings
@@ -40,6 +45,22 @@ _STATUS_ROWS = (
     ("banned", repo_mod.STATUS_BANNED),
 )
 _KNOWN_STATUSES = {key for _, key in _STATUS_ROWS}
+
+# (команда, описание) для персонального меню админов (app.setup_bot_commands).
+ADMIN_COMMANDS: list[tuple[str, str]] = [
+    ("admin_help", "Справка по админ-командам"),
+    ("admin_stats", "Сводка по статусам/тарифам/трафику"),
+    ("admin_stats_full", "Расширенная статистика"),
+    ("admin_list", "Список юзеров с пагинацией"),
+    ("admin_find", "Карточка пользователя"),
+    ("admin_approve", "Апрув under_approve → pending"),
+    ("admin_ban", "Забанить пользователя"),
+    ("admin_unban", "Разбанить пользователя"),
+    ("admin_revoke", "Отозвать VPN-клиента"),
+    ("admin_delete", "Удалить пользователя из БД"),
+    ("admin_grant_paid", "Выдать платный тариф"),
+    ("admin_broadcast", "Рассылка (только active)"),
+]
 
 
 class IsAdmin(BaseFilter):
@@ -69,8 +90,7 @@ def _parse_int(arg: str | None) -> int | None:
         return None
 
 
-@router.message(Command("admin_stats"))
-async def admin_stats(message: Message, repo: Repository) -> None:
+async def _stats_text(repo: Repository) -> str:
     st = await asyncio.to_thread(repo.stats_counts)
     by_status = st["by_status"]
     by_tier = st["by_tier"]
@@ -90,7 +110,12 @@ async def admin_stats(message: Message, repo: Repository) -> None:
         f"Суммарный трафик: {total_gb:.2f} GB",
         f"<i>БД: {st['db_path']}</i>",
     ]
-    await message.answer("\n".join(lines))
+    return "\n".join(lines)
+
+
+@router.message(Command("admin_stats"))
+async def admin_stats(message: Message, repo: Repository) -> None:
+    await message.answer(await _stats_text(repo))
 
 
 @router.message(Command("admin_find"))
@@ -126,6 +151,27 @@ async def admin_find(message: Message, command: CommandObject, repo: Repository)
     await message.answer("\n".join(lines))
 
 
+async def _do_admin_ban(
+    telegram_id: int, reason: str, by: int, repo: Repository, settings: Settings
+) -> str:
+    """Общая бизнес-логика бана для /admin_ban и кнопки adm_ban. Возвращает отчёт."""
+    # Revoke the Xray client BEFORE writing the ban so the user loses VPN
+    # access immediately, not just on the next middleware check.
+    user = await asyncio.to_thread(repo.get_user, telegram_id)
+    if user and user.vpn_client_id:
+        try:
+            await asyncio.to_thread(vpn_client.delete_client, user.vpn_client_id, settings)
+        except vpn_client.VpnEngineError as e:
+            log.error("admin_ban: delete_client(%s) не удался: %s", telegram_id, e)
+        await asyncio.to_thread(repo.set_vpn_client, telegram_id, None, None)
+    await asyncio.to_thread(repo.add_ban, telegram_id, reason, None)  # permanent
+    await asyncio.to_thread(repo.set_status, telegram_id, repo_mod.STATUS_BANNED)
+    await asyncio.to_thread(
+        repo.audit, "banned", telegram_id, {"by": by, "reason": reason}
+    )
+    return f"🚫 {telegram_id} забанен. Причина: {reason}"
+
+
 @router.message(Command("admin_ban"))
 async def admin_ban(
     message: Message, command: CommandObject, repo: Repository, settings: Settings
@@ -136,19 +182,9 @@ async def admin_ban(
         await message.answer("Использование: <code>/admin_ban &lt;telegram_id&gt; [причина]</code>")
         return
     reason = parts[1] if len(parts) > 1 else "admin ban"
-    # Revoke the Xray client BEFORE writing the ban so the user loses VPN
-    # access immediately, not just on the next middleware check.
-    user = await asyncio.to_thread(repo.get_user, tid)
-    if user and user.vpn_client_id:
-        try:
-            await asyncio.to_thread(vpn_client.delete_client, user.vpn_client_id, settings)
-        except vpn_client.VpnEngineError as e:
-            log.error("admin_ban: delete_client(%s) не удался: %s", tid, e)
-        await asyncio.to_thread(repo.set_vpn_client, tid, None, None)
-    await asyncio.to_thread(repo.add_ban, tid, reason, None)  # permanent
-    await asyncio.to_thread(repo.set_status, tid, repo_mod.STATUS_BANNED)
-    await asyncio.to_thread(repo.audit, "banned", tid, {"by": message.from_user.id, "reason": reason})
-    await message.answer(f"🚫 {tid} забанен. Причина: {reason}")
+    await message.answer(
+        await _do_admin_ban(tid, reason, message.from_user.id, repo, settings)
+    )
 
 
 @router.message(Command("admin_unban"))
@@ -226,6 +262,31 @@ async def admin_broadcast(message: Message, command: CommandObject, bot: Bot, re
     await message.answer(f"📣 Рассылка: отправлено {sent}, ошибок {failed} (только active).")
 
 
+async def _do_admin_approve(telegram_id: int, by: int, bot: Bot, repo: Repository) -> str:
+    """under_approve → pending_subscription. Общая логика /admin_approve и кнопки
+    adm_approve. Возвращает отчёт для админа."""
+    user = await asyncio.to_thread(repo.get_user, telegram_id)
+    if user is None:
+        return "Пользователь не найден."
+    if user.status != repo_mod.STATUS_UNDER_APPROVE:
+        return f"Нельзя апрувить: статус <code>{user.status}</code> (нужен under_approve)."
+    await asyncio.to_thread(repo.set_status, telegram_id, repo_mod.STATUS_PENDING)
+    await asyncio.to_thread(repo.audit, "admin_approve", telegram_id, {"by": by})
+    # уведомим юзера, если бот может ему писать
+    try:
+        await bot.send_message(
+            telegram_id,
+            "✅ Ваш доступ к HideWay VPN одобрен!\n"
+            "Подпишитесь на наш канал и отправьте /get — выдам ссылку для подключения.",
+        )
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+    return (
+        f"✅ {telegram_id} апрувнут → pending_subscription. "
+        "Теперь он может пройти /start → подписка → /get."
+    )
+
+
 @router.message(Command("admin_approve"))
 async def admin_approve(message: Message, command: CommandObject, bot: Bot, repo: Repository) -> None:
     """under_approve → pending_subscription. Дальше юзер сам проходит обычный флоу."""
@@ -233,31 +294,8 @@ async def admin_approve(message: Message, command: CommandObject, bot: Bot, repo
     if tid is None:
         await message.answer("Использование: <code>/admin_approve &lt;telegram_id&gt;</code>")
         return
-    user = await asyncio.to_thread(repo.get_user, tid)
-    if user is None:
-        await message.answer("Пользователь не найден.")
-        return
-    if user.status != repo_mod.STATUS_UNDER_APPROVE:
-        await message.answer(
-            f"Нельзя апрувить: статус <code>{user.status}</code> (нужен under_approve)."
-        )
-        return
-    await asyncio.to_thread(repo.set_status, tid, repo_mod.STATUS_PENDING)
-    await asyncio.to_thread(
-        repo.audit, "admin_approve", tid, {"by": message.from_user.id}
-    )
-    # уведомим юзера, если бот может ему писать
-    try:
-        await bot.send_message(
-            tid,
-            "✅ Ваш доступ к HideWay VPN одобрен!\n"
-            "Подпишитесь на наш канал и отправьте /get — выдам ссылку для подключения.",
-        )
-    except (TelegramForbiddenError, TelegramBadRequest):
-        pass
     await message.answer(
-        f"✅ {tid} апрувнут → pending_subscription. "
-        "Теперь он может пройти /start → подписка → /get."
+        await _do_admin_approve(tid, message.from_user.id, bot, repo)
     )
 
 
@@ -364,15 +402,8 @@ async def admin_stats_full(message: Message, repo: Repository) -> None:
     await message.answer("\n".join(lines))
 
 
-@router.message(Command("admin_help"))
-async def admin_help(message: Message, settings: Settings) -> None:
-    user_id = message.from_user.id if message.from_user else None
-    log.info(
-        "admin_help: telegram_id=%s is_admin=%s admin_user_ids=%s",
-        user_id, settings.is_admin(user_id) if user_id is not None else False,
-        settings.admin_user_ids,
-    )
-    text = (
+def _admin_help_text() -> str:
+    return (
         f"<b>🛠 Админ-команды HideWay</b> <i>(v{__version__})</i>\n\n"
         "<code>/admin_stats</code> — сводка по статусам/тарифам/трафику\n"
         "<code>/admin_stats_full</code> — + топ по трафику и сводка paid\n"
@@ -387,4 +418,161 @@ async def admin_help(message: Message, settings: Settings) -> None:
         "<code>/admin_broadcast &lt;текст&gt;</code> — рассылка (только active)\n"
         "<code>/admin_help</code> — эта справка"
     )
-    await message.answer(text)
+
+
+@router.message(Command("admin_help"))
+async def admin_help(message: Message, settings: Settings) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    log.info(
+        "admin_help: telegram_id=%s is_admin=%s admin_user_ids=%s",
+        user_id, settings.is_admin(user_id) if user_id is not None else False,
+        settings.admin_user_ids,
+    )
+    await message.answer(_admin_help_text())
+
+
+# ============================ inline админ-панель ============================
+#
+# Кнопки видны только админам, но callback_data подделывается — поэтому КАЖДЫЙ
+# callback-хендлер ниже отдельно проверяет _is_admin (router.message.filter
+# закрывает только message-хендлеры).
+
+PANEL_PAGE_SIZE = 8  # на страницу панели: 8 юзеров = 16 кнопок + навигация
+
+
+def _is_admin(call: CallbackQuery, settings: Settings) -> bool:
+    user_id = call.from_user.id if call.from_user else None
+    ok = user_id is not None and settings.is_admin(user_id)
+    if not ok:
+        log.warning("admin callback %r от не-админа %s — отклонено", call.data, user_id)
+    return ok
+
+
+def _panel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Список under_approve", callback_data="adm_page:1")],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
+            [InlineKeyboardButton(text="❓ Справка", callback_data="adm_help")],
+        ]
+    )
+
+
+def _back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]
+        ]
+    )
+
+
+async def _under_approve_page(repo: Repository, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Строит текст + клавиатуру страницы списка under_approve."""
+    status = repo_mod.STATUS_UNDER_APPROVE
+    total = await asyncio.to_thread(repo.count_users, status)
+    if total == 0:
+        return "✅ Нет пользователей в статусе under_approve.", _back_kb()
+
+    pages = (total + PANEL_PAGE_SIZE - 1) // PANEL_PAGE_SIZE
+    page = min(max(1, page), pages)
+    offset = (page - 1) * PANEL_PAGE_SIZE
+    users = await asyncio.to_thread(repo.list_all_users, status, PANEL_PAGE_SIZE, offset)
+
+    lines = [f"<b>📋 under_approve</b> — страница {page}/{pages}, всего {total}", ""]
+    rows: list[list[InlineKeyboardButton]] = []
+    for u in users:
+        lines.append(f"<code>{u.telegram_id}</code> (@{u.username or '—'})")
+        rows.append([
+            InlineKeyboardButton(text=f"✅ {u.telegram_id}", callback_data=f"adm_approve:{u.telegram_id}"),
+            InlineKeyboardButton(text=f"❌ {u.telegram_id}", callback_data=f"adm_ban:{u.telegram_id}"),
+        ])
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"adm_page:{page - 1}"))
+    if page < pages:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"adm_page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _edit(call: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
+    """edit_text, игнорируя 'message is not modified'."""
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            await call.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin_panel")
+async def cb_admin_panel(call: CallbackQuery, settings: Settings) -> None:
+    if not _is_admin(call, settings):
+        await call.answer("Недостаточно прав.", show_alert=True)
+        return
+    await call.message.answer("<b>⚙️ Админ-панель</b>", reply_markup=_panel_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_page:"))
+async def cb_admin_page(call: CallbackQuery, repo: Repository, settings: Settings) -> None:
+    if not _is_admin(call, settings):
+        await call.answer("Недостаточно прав.", show_alert=True)
+        return
+    page = _parse_int(call.data.split(":", 1)[1]) or 1
+    text, kb = await _under_approve_page(repo, page)
+    await _edit(call, text, kb)
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_stats")
+async def cb_admin_stats(call: CallbackQuery, repo: Repository, settings: Settings) -> None:
+    if not _is_admin(call, settings):
+        await call.answer("Недостаточно прав.", show_alert=True)
+        return
+    await _edit(call, await _stats_text(repo), _back_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_help")
+async def cb_admin_help(call: CallbackQuery, settings: Settings) -> None:
+    if not _is_admin(call, settings):
+        await call.answer("Недостаточно прав.", show_alert=True)
+        return
+    await _edit(call, _admin_help_text(), _back_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_approve:"))
+async def cb_admin_approve(
+    call: CallbackQuery, bot: Bot, repo: Repository, settings: Settings
+) -> None:
+    if not _is_admin(call, settings):
+        await call.answer("Недостаточно прав.", show_alert=True)
+        return
+    tid = _parse_int(call.data.split(":", 1)[1])
+    if tid is None:
+        await call.answer("Некорректный ID.", show_alert=True)
+        return
+    result = await _do_admin_approve(tid, call.from_user.id, bot, repo)
+    await call.answer("✅ Одобрен" if result.startswith("✅") else result[:200], show_alert=True)
+    # список изменился — перерисовываем первую страницу
+    text, kb = await _under_approve_page(repo, 1)
+    await _edit(call, text, kb)
+
+
+@router.callback_query(F.data.startswith("adm_ban:"))
+async def cb_admin_ban(call: CallbackQuery, repo: Repository, settings: Settings) -> None:
+    if not _is_admin(call, settings):
+        await call.answer("Недостаточно прав.", show_alert=True)
+        return
+    tid = _parse_int(call.data.split(":", 1)[1])
+    if tid is None:
+        await call.answer("Некорректный ID.", show_alert=True)
+        return
+    await _do_admin_ban(tid, f"admin panel ban by {call.from_user.id}", call.from_user.id, repo, settings)
+    await call.answer("🚫 Забанен", show_alert=True)
+    text, kb = await _under_approve_page(repo, 1)
+    await _edit(call, text, kb)
