@@ -16,6 +16,7 @@ DI: aiogram прокидывает в хендлеры `repo`, `settings`, `paym
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 
 from aiogram import Bot, F, Router
@@ -23,6 +24,7 @@ from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -39,6 +41,23 @@ log = logging.getLogger(__name__)
 router = Router(name="user")
 
 GB = 1_000_000_000
+
+# (команда, описание) — источник правды и для меню бота (app.setup_bot_commands),
+# и для текста /help. Порядок = порядок в меню.
+USER_COMMANDS: list[tuple[str, str]] = [
+    ("start", "Начать / перезапустить"),
+    ("status", "Статус подписки и трафика"),
+    ("get", "Получить VPN-ключ"),
+    ("upgrade", "Перейти на платный тариф"),
+    ("check_subscription", "Проверить подписку на канал"),
+    ("help", "Список команд"),
+]
+
+
+def _help_text() -> str:
+    lines = ["<b>❓ Команды HideWay VPN</b>", ""]
+    lines += [f"/{cmd} — {desc}" for cmd, desc in USER_COMMANDS]
+    return "\n".join(lines)
 
 
 # ============================ keyboards ============================
@@ -57,6 +76,22 @@ def _upgrade_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="💳 Перейти на платный (20 GB)", callback_data="upgrade")]
         ]
     )
+
+
+def _main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="🔑 Мой ключ", callback_data="get_key"),
+            InlineKeyboardButton(text="📊 Статус", callback_data="show_status"),
+        ],
+        [InlineKeyboardButton(text="💳 Оплата", callback_data="upgrade")],
+        [InlineKeyboardButton(text="❓ Помощь", callback_data="help")],
+    ]
+    if is_admin:
+        rows.append(
+            [InlineKeyboardButton(text="⚙️ Админ-панель", callback_data="admin_panel")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ============================ helpers (reused by jobs) ============================
@@ -155,12 +190,21 @@ async def activate_free(bot: Bot, repo: Repository, settings: Settings, telegram
 
 # ============================ presentation ============================
 
+def _traffic_bar(used_gb: float, limit_gb: float, width: int = 10) -> str:
+    """Визуальный индикатор расхода трафика. Перерасход рисуется как 100%."""
+    ratio = min(used_gb / limit_gb, 1.0) if limit_gb > 0 else 0
+    filled = round(ratio * width)
+    return "▓" * filled + "░" * (width - filled)
+
+
 def _status_text(user: User) -> str:
     used_gb = user.traffic_used_bytes / GB
+    limit_gb = user.traffic_limit_gb
     lines = [
         f"<b>Тариф:</b> {'Платный' if user.tier == repo_mod.TIER_PAID else 'Бесплатный'}",
         f"<b>Статус:</b> {user.status}",
-        f"<b>Трафик:</b> {used_gb:.2f} / {user.traffic_limit_gb:.0f} GB",
+        f"<b>Трафик:</b> {_traffic_bar(used_gb, limit_gb)} "
+        f"{used_gb:.1f}/{limit_gb:.0f} GB",
     ]
     if user.tier == repo_mod.TIER_PAID and user.paid_until:
         import datetime as _dt
@@ -169,12 +213,46 @@ def _status_text(user: User) -> str:
     return "\n".join(lines)
 
 
+QR_HINT = (
+    "Отсканируйте QR в приложении v2rayNG / Streisand / Shadowrocket, "
+    "либо скопируйте ссылку вручную."
+)
+# Telegram ограничивает подпись к фото 1024 символами; длинную ссылку шлём текстом
+_CAPTION_LIMIT = 1024
+
+
+def _qr_png(url: str) -> bytes:
+    """PNG с QR-кодом ссылки. Вынесено отдельно, чтобы мокать в тестах."""
+    import qrcode  # локальный импорт: бот работает и без библиотеки
+
+    buf = io.BytesIO()
+    qrcode.make(url).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 async def _send_link(message: Message, access_url: str) -> None:
     await message.answer(
         "🔑 Ваша ссылка для подключения (импортируйте в v2rayNG / Hiddify / Streisand / FoXray):"
     )
-    # отдельным сообщением без parse_mode — ссылка с & не ломается экранированием
-    await message.answer(access_url)
+    caption = f"{access_url}\n\n{QR_HINT}"
+    try:
+        png = await asyncio.to_thread(_qr_png, access_url)
+        if len(caption) > _CAPTION_LIMIT:
+            raise ValueError("caption too long for send_photo")
+        # answer_photo == bot.send_photo в этот чат; BufferedInputFile — способ
+        # отдать сырые байты в aiogram 3 без временного файла
+        await message.answer_photo(
+            BufferedInputFile(png, filename="hideway_key.png"),
+            caption=caption,
+            parse_mode=None,  # ссылка с & не ломается HTML-экранированием
+        )
+        return
+    except Exception as e:  # битая ссылка, нет qrcode, ошибка отправки фото
+        log.warning("QR-код не сгенерирован/не отправлен: %s", e)
+
+    # фолбэк: отдельным сообщением без parse_mode — ссылка не экранируется
+    await message.answer(access_url, parse_mode=None)
+    await message.answer(QR_HINT)
 
 
 # ============================ commands ============================
@@ -201,20 +279,25 @@ async def cmd_start(message: Message, bot: Bot, repo: Repository, settings: Sett
         await message.answer(
             "👋 <b>HideWay VPN</b>\n\n"
             "Ваша заявка на доступ получена и ожидает подтверждения администратора. "
-            "Как только её одобрят, вы сможете получить ссылку командой /get."
+            "Как только её одобрят, вы сможете получить ссылку командой /get.",
+            reply_markup=_main_menu_kb(settings.is_admin(tid)),
         )
         return
 
-    await message.answer(
-        "👋 <b>HideWay VPN</b>\n\n"
-        f"Бесплатный тариф: <b>{settings.free_tier_gb:.0f} GB/мес</b> за подписку на наш канал.\n"
-        "Подпишитесь и нажмите кнопку проверки — выдам ссылку для подключения.",
-        reply_markup=_check_sub_kb(),
-    )
-
     ok, url = await activate_free(bot, repo, settings, tid)
     if ok and url:
+        await message.answer(
+            "👋 <b>HideWay VPN</b>\n\nДоступ активен. Меню ниже:",
+            reply_markup=_main_menu_kb(settings.is_admin(tid)),
+        )
         await _send_link(message, url)
+    else:
+        await message.answer(
+            "👋 <b>HideWay VPN</b>\n\n"
+            f"Бесплатный тариф: <b>{settings.free_tier_gb:.0f} GB/мес</b> за подписку на наш канал.\n"
+            "Подпишитесь и нажмите кнопку проверки — выдам ссылку для подключения.",
+            reply_markup=_check_sub_kb(),
+        )
 
 
 @router.callback_query(F.data == "check_sub")
@@ -242,9 +325,9 @@ async def cmd_check_subscription(message: Message, bot: Bot, repo: Repository, s
         )
 
 
-@router.message(Command("status"))
-async def cmd_status(message: Message, repo: Repository, settings: Settings) -> None:
-    user = await asyncio.to_thread(repo.get_user, message.from_user.id)
+# общая логика /status и /get — вызывается и из Command-, и из callback-хендлеров
+async def _do_status(message: Message, telegram_id: int, repo: Repository) -> None:
+    user = await asyncio.to_thread(repo.get_user, telegram_id)
     if user is None:
         await message.answer("Вы ещё не зарегистрированы. Отправьте /start.")
         return
@@ -252,9 +335,10 @@ async def cmd_status(message: Message, repo: Repository, settings: Settings) -> 
     await message.answer(_status_text(user), reply_markup=kb)
 
 
-@router.message(Command("get"))
-async def cmd_get(message: Message, bot: Bot, repo: Repository, settings: Settings) -> None:
-    user = await asyncio.to_thread(repo.get_user, message.from_user.id)
+async def _do_get(
+    message: Message, telegram_id: int, bot: Bot, repo: Repository, settings: Settings
+) -> None:
+    user = await asyncio.to_thread(repo.get_user, telegram_id)
     if user is None:
         await message.answer("Сначала отправьте /start.")
         return
@@ -265,7 +349,7 @@ async def cmd_get(message: Message, bot: Bot, repo: Repository, settings: Settin
         await message.answer("⏳ Ваша заявка ещё не подтверждена администратором.")
         return
     # не активен — пробуем активировать (вдруг уже подписан)
-    ok, url = await activate_free(bot, repo, settings, message.from_user.id)
+    ok, url = await activate_free(bot, repo, settings, telegram_id)
     if ok and url:
         await _send_link(message, url)
     else:
@@ -273,6 +357,43 @@ async def cmd_get(message: Message, bot: Bot, repo: Repository, settings: Settin
             "Доступ не активен. Подпишитесь на канал и нажмите проверку.",
             reply_markup=_check_sub_kb(),
         )
+
+
+@router.message(Command("status"))
+async def cmd_status(message: Message, repo: Repository, settings: Settings) -> None:
+    await _do_status(message, message.from_user.id, repo)
+
+
+@router.message(Command("get"))
+async def cmd_get(message: Message, bot: Bot, repo: Repository, settings: Settings) -> None:
+    await _do_get(message, message.from_user.id, bot, repo, settings)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message, settings: Settings) -> None:
+    await message.answer(
+        _help_text(), reply_markup=_main_menu_kb(settings.is_admin(message.from_user.id))
+    )
+
+
+@router.callback_query(F.data == "show_status")
+async def cb_show_status(call: CallbackQuery, repo: Repository) -> None:
+    await _do_status(call.message, call.from_user.id, repo)
+    await call.answer()
+
+
+@router.callback_query(F.data == "get_key")
+async def cb_get_key(call: CallbackQuery, bot: Bot, repo: Repository, settings: Settings) -> None:
+    await _do_get(call.message, call.from_user.id, bot, repo, settings)
+    await call.answer()
+
+
+@router.callback_query(F.data == "help")
+async def cb_help(call: CallbackQuery, settings: Settings) -> None:
+    await call.message.answer(
+        _help_text(), reply_markup=_main_menu_kb(settings.is_admin(call.from_user.id))
+    )
+    await call.answer()
 
 
 @router.message(Command("upgrade"))

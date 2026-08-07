@@ -18,11 +18,38 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 
 from ..config import Settings, get_payment_provider, load_settings
 from ..db.repository import Repository
 from . import admin_handlers, handlers, jobs
 from .middleware import BanMiddleware, RateLimitMiddleware
+
+log = logging.getLogger(__name__)
+
+# Меню бота (кнопка "/" в клиенте Telegram). Списки команд живут рядом
+# с хендлерами, здесь только превращаем их в BotCommand.
+USER_COMMANDS = [BotCommand(command=c, description=d) for c, d in handlers.USER_COMMANDS]
+ADMIN_COMMANDS = USER_COMMANDS + [
+    BotCommand(command=c, description=d) for c, d in admin_handlers.ADMIN_COMMANDS
+]
+
+
+async def setup_bot_commands(bot: Bot, settings: Settings) -> None:
+    """Ставит общее меню команд и расширенное — персонально каждому админу.
+
+    Личный scope админа перекрывает default только в его чате с ботом.
+    Если админ ещё не писал боту, Telegram отвечает ошибкой — она не должна
+    ронять старт, поэтому ловим и логируем."""
+    await bot.set_my_commands(USER_COMMANDS, scope=BotCommandScopeDefault())
+    for admin_id in settings.admin_user_ids:
+        try:
+            await bot.set_my_commands(
+                ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id)
+            )
+        except (TelegramBadRequest, TelegramForbiddenError) as e:
+            log.warning("set_my_commands для админа %s не удался: %s", admin_id, e)
 
 
 def build_dispatcher(settings: Settings, repo: Repository, payments=None) -> Dispatcher:
@@ -64,9 +91,10 @@ async def main() -> None:
     payments = get_payment_provider(settings)
     dp = build_dispatcher(settings, repo, payments)
 
-    logging.getLogger(__name__).info(
+    log.info(
         "HideWay bot запускается (polling), платёжный провайдер: %s", payments.name
     )
+    await setup_bot_commands(bot, settings)
     job_tasks = jobs.start_jobs(bot, repo, settings, payments)
     try:
         await dp.start_polling(bot)
