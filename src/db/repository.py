@@ -328,6 +328,17 @@ class Repository:
                 (status, confirmed_at, provider_invoice_id),
             )
 
+    def list_open_payments(self, provider: str) -> list[sqlite3.Row]:
+        """Незакрытые счета провайдера (created/pending) — вход для поллинга
+        статусов (jobs.check_pending_payments). confirmed/failed/expired
+        не возвращаются: повторная обработка исключена."""
+        return self._conn.execute(
+            """SELECT * FROM payments
+               WHERE provider = ? AND status IN ('created', 'pending')
+               ORDER BY created_at""",
+            (provider,),
+        ).fetchall()
+
     def list_payments(self, telegram_id: int) -> list[sqlite3.Row]:
         return self._conn.execute(
             "SELECT * FROM payments WHERE telegram_id = ? ORDER BY created_at DESC",
