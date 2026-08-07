@@ -61,6 +61,12 @@ class Settings:
 
     # === Платёжный шлюз ===
     payment_provider: str = "stub"
+    # CryptoCloud (PAYMENT_PROVIDER=cryptocloud). secret нужен только для
+    # вебхука — он отключён, подтверждение оплаты идёт поллингом.
+    cryptocloud_api_key: str = ""
+    cryptocloud_shop_id: str = ""
+    cryptocloud_secret: str = ""
+    payment_poll_interval_seconds: int = 30
 
     # === Rate limiting / anti-abuse ===
     rate_limit_max: int = 5
@@ -118,6 +124,10 @@ def load_settings(env_file: str | os.PathLike | None = ".env") -> Settings:
         paid_tier_price_usd=_f("PAID_TIER_PRICE_USD", 2.99),
         low_traffic_warning_mb=_f("LOW_TRAFFIC_WARNING_MB", 100.0),
         payment_provider=os.getenv("PAYMENT_PROVIDER", "stub").strip(),
+        cryptocloud_api_key=os.getenv("CRYPTOCLOUD_API_KEY", "").strip(),
+        cryptocloud_shop_id=os.getenv("CRYPTOCLOUD_SHOP_ID", "").strip(),
+        cryptocloud_secret=os.getenv("CRYPTOCLOUD_SECRET", "").strip(),
+        payment_poll_interval_seconds=_i("PAYMENT_POLL_INTERVAL_SECONDS", 30),
         rate_limit_max=_i("RATE_LIMIT_MAX", 5),
         rate_limit_window=_i("RATE_LIMIT_WINDOW", 60),
         ban_trigger=_i("BAN_TRIGGER", 3),

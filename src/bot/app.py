@@ -25,13 +25,16 @@ from . import admin_handlers, handlers, jobs
 from .middleware import BanMiddleware, RateLimitMiddleware
 
 
-def build_dispatcher(settings: Settings, repo: Repository) -> Dispatcher:
+def build_dispatcher(settings: Settings, repo: Repository, payments=None) -> Dispatcher:
     """Собирает Dispatcher и кладёт зависимости в workflow data —
-    aiogram прокидывает их в хендлеры по имени параметра."""
+    aiogram прокидывает их в хендлеры по имени параметра.
+
+    `payments` можно передать снаружи, чтобы хендлеры и фоновая задача
+    check_pending_payments работали с одним экземпляром провайдера."""
     dp = Dispatcher()
     dp["repo"] = repo
     dp["settings"] = settings
-    dp["payments"] = get_payment_provider(settings)
+    dp["payments"] = payments if payments is not None else get_payment_provider(settings)
 
     # мидлвары: сначала бан, затем rate-limit (порядок важен)
     for observer in (dp.message, dp.callback_query):
@@ -58,10 +61,13 @@ async def main() -> None:
         token=settings.telegram_bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = build_dispatcher(settings, repo)
+    payments = get_payment_provider(settings)
+    dp = build_dispatcher(settings, repo, payments)
 
-    logging.getLogger(__name__).info("HideWay bot запускается (polling)…")
-    job_tasks = jobs.start_jobs(bot, repo, settings)
+    logging.getLogger(__name__).info(
+        "HideWay bot запускается (polling), платёжный провайдер: %s", payments.name
+    )
+    job_tasks = jobs.start_jobs(bot, repo, settings, payments)
     try:
         await dp.start_polling(bot)
     finally:

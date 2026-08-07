@@ -303,6 +303,16 @@ async def _handle_upgrade(
     if invoice.status == INVOICE_UNAVAILABLE or not invoice.pay_url:
         await message.answer(invoice.message or "Оплата временно недоступна.")
     else:
+        # Вебхука нет: оплату подтверждает фоновый поллинг
+        # (jobs.check_pending_payments), уведомление придёт отдельным сообщением.
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Оплатить", url=invoice.pay_url)]
+            ]
+        )
         await message.answer(
-            f"💳 Счёт на ${invoice.amount_usd:.2f} создан.\nОплатите по ссылке:\n{invoice.pay_url}"
+            f"💳 Счёт на ${invoice.amount_usd:.2f} создан.\n"
+            f"Оплатите по ссылке — тариф продлится автоматически "
+            f"в течение минуты после подтверждения платежа:\n{invoice.pay_url}",
+            reply_markup=kb,
         )

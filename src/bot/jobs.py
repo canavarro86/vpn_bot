@@ -9,6 +9,7 @@
   - check_paid_expiry    (24ч)   — истёк paid → откат на free (если подписан) либо revoke
   - sample_traffic       (interval) — снять дельту трафика, лимиты + уведомления
   - monthly_reset        (24ч)   — 1-го числа обнулить трафик периода + вернуть заблокированных
+  - check_pending_payments (30с) — опрос статусов счетов CryptoCloud (вебхука нет)
 
 Логика лимитов трафика — здесь (на стороне бота), не в Xray (ТЗ раздел 1, 3).
 
@@ -25,9 +26,11 @@ import logging
 
 from aiogram import Bot
 
-from ..config import Settings
+from ..config import Settings, get_payment_provider
 from ..db import repository as repo_mod
 from ..db.repository import Repository, User
+from ..payments import cryptocloud
+from ..payments.provider import PaymentProvider
 from ..vpn_engine import client as vpn_client
 from ..vpn_engine import usage_tracker
 from . import handlers as user_handlers
@@ -37,6 +40,9 @@ log = logging.getLogger(__name__)
 GB = 1_000_000_000
 MB = 1_000_000
 DAY = 86_400
+
+# Длительность оплаченного периода за один счёт (ТЗ: paid = 2.99$/месяц).
+PAID_PERIOD_DAYS = 30
 
 
 async def _notify(bot: Bot, telegram_id: int, text: str) -> None:
@@ -134,7 +140,8 @@ async def sample_traffic(bot: Bot, repo: Repository, settings: Settings) -> None
             await _notify(
                 bot, tid,
                 "🚫 Лимит трафика исчерпан. Доступ заблокирован до следующего "
-                "расчётного периода. /upgrade — больше трафика.",
+                "расчётного периода. /upgrade — больше трафика. Вы можете приобрести "
+                "платный тариф за 2.99$ в месяц.",
             )
         # остался ~предупредительный порог → одно уведомление за период
         elif prev < warn_at <= new and not user.low_traffic_notified:
@@ -183,6 +190,94 @@ async def monthly_reset(bot: Bot, repo: Repository, settings: Settings) -> None:
     log.info("monthly_reset: %d пользователей, восстановлено %d", len(users), restored)
 
 
+async def check_pending_payments(
+    bot: Bot, repo: Repository, settings: Settings, payments: PaymentProvider
+) -> None:
+    """Поллинг статусов незакрытых счетов (вебхука нет — нет домена/HTTPS).
+
+    Идемпотентность: берём только payments со status created/pending
+    (см. repo.list_open_payments) — confirmed/failed/expired повторно
+    не обрабатываются.
+    """
+    get_status = getattr(payments, "get_invoice_status", None)
+    if get_status is None:
+        return  # провайдер без поллинга (stub) — задача простаивает
+    rows = await asyncio.to_thread(repo.list_open_payments, payments.name)
+    for row in rows:
+        invoice_id = row["provider_invoice_id"]
+        status = await asyncio.to_thread(get_status, invoice_id)
+        if status is None:
+            continue  # сеть/шлюз недоступен — попробуем на следующей итерации
+        if status in cryptocloud.CC_SUCCESS:
+            await _confirm_payment(bot, repo, settings, row)
+        elif status in cryptocloud.CC_DEAD:
+            await asyncio.to_thread(repo.set_payment_status, invoice_id, status)
+            await asyncio.to_thread(
+                repo.audit, "payment_closed", row["telegram_id"],
+                {"invoice_id": invoice_id, "status": status},
+            )
+            await _notify(
+                bot, row["telegram_id"],
+                "🧾 Счёт на оплату закрыт (истёк или отменён). /upgrade — выставить заново.",
+            )
+        # created/partial — счёт ещё живой, ждём следующей итерации
+
+
+async def _confirm_payment(
+    bot: Bot, repo: Repository, settings: Settings, row
+) -> None:
+    """Оплата подтверждена: продлеваем paid, чиним доступ, уведомляем.
+
+    Логика продления — как в admin_handlers.admin_grant_paid: если платный
+    период ещё не истёк, дни прибавляются к нему, иначе отсчёт от now.
+    """
+    tid = row["telegram_id"]
+    invoice_id = row["provider_invoice_id"]
+    user = await asyncio.to_thread(repo.get_user, tid)
+    if user is None:
+        log.error("оплата %s: пользователь %s не найден", invoice_id, tid)
+        await asyncio.to_thread(repo.set_payment_status, invoice_id, "confirmed", True)
+        return
+
+    now = repo_mod.now_ts()
+    base = user.paid_until if (user.paid_until and user.paid_until > now) else now
+    paid_until = base + PAID_PERIOD_DAYS * DAY
+
+    # Статус платежа переводим ПЕРВЫМ: если дальше что-то упадёт, следующая
+    # итерация не начислит период повторно.
+    await asyncio.to_thread(repo.set_payment_status, invoice_id, "confirmed", True)
+    await asyncio.to_thread(
+        repo.set_tier, tid, repo_mod.TIER_PAID, settings.paid_tier_gb, paid_until
+    )
+
+    # Клиент мог быть удалён из Xray по лимиту free-тира — с новым лимитом
+    # доступ снова в пределах квоты, возвращаем.
+    if user.vpn_client_id and user.traffic_used_bytes < int(settings.paid_tier_gb * GB):
+        try:
+            await asyncio.to_thread(
+                vpn_client.restore_client, tid, user.vpn_client_id, settings
+            )
+        except vpn_client.VpnEngineError as e:
+            log.error("restore_client после оплаты %s не удался: %s", tid, e)
+
+    await asyncio.to_thread(
+        repo.audit, "payment_confirmed", tid,
+        {
+            "invoice_id": invoice_id,
+            "amount_usd": row["amount_usd"],
+            "paid_until": paid_until,
+            "provider": row["provider"],
+        },
+    )
+    await _notify(
+        bot, tid,
+        f"✅ Оплата получена. Тариф продлён до "
+        f"{dt.datetime.fromtimestamp(paid_until, dt.timezone.utc):%d.%m.%Y} "
+        f"({settings.paid_tier_gb:.0f} GB). Спасибо!",
+    )
+    log.info("оплата %s подтверждена: %s → paid до %s", invoice_id, tid, paid_until)
+
+
 # ============================ раннер ============================
 
 async def _loop(name: str, coro, interval: int, *args) -> None:
@@ -197,8 +292,19 @@ async def _loop(name: str, coro, interval: int, *args) -> None:
         await asyncio.sleep(interval)
 
 
-def start_jobs(bot: Bot, repo: Repository, settings: Settings) -> list[asyncio.Task]:
-    """Запускает все фоновые задачи, возвращает список тасков (для отмены при стопе)."""
+def start_jobs(
+    bot: Bot,
+    repo: Repository,
+    settings: Settings,
+    payments: PaymentProvider | None = None,
+) -> list[asyncio.Task]:
+    """Запускает все фоновые задачи, возвращает список тасков (для отмены при стопе).
+
+    `payments` — тот же экземпляр провайдера, что и у хендлеров (передаётся из
+    app.py); если не передан, собирается фабрикой.
+    """
+    if payments is None:
+        payments = get_payment_provider(settings)
     tasks = [
         asyncio.create_task(_loop("check_subscriptions", check_subscriptions, DAY, bot, repo, settings)),
         asyncio.create_task(_loop("check_paid_expiry", check_paid_expiry, DAY, bot, repo, settings)),
@@ -206,6 +312,10 @@ def start_jobs(bot: Bot, repo: Repository, settings: Settings) -> list[asyncio.T
         asyncio.create_task(
             _loop("sample_traffic", sample_traffic,
                   settings.traffic_sample_interval_seconds, bot, repo, settings)
+        ),
+        asyncio.create_task(
+            _loop("check_pending_payments", check_pending_payments,
+                  settings.payment_poll_interval_seconds, bot, repo, settings, payments)
         ),
     ]
     log.info("фоновые задачи запущены: %d", len(tasks))
