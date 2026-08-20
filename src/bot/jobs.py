@@ -110,47 +110,50 @@ async def sample_traffic(bot: Bot, repo: Repository, settings: Settings) -> None
         return
     warn_bytes = settings.low_traffic_warning_mb * MB
     for email, delta in per_email.items():
-        tid = usage_tracker.telegram_id_from_email(email)
-        if tid is None or delta <= 0:
-            continue
-        user = await asyncio.to_thread(repo.get_user, tid)
-        if user is None:
-            continue
+        try:
+            tid = usage_tracker.telegram_id_from_email(email)
+            if tid is None or delta <= 0:
+                continue
+            user = await asyncio.to_thread(repo.get_user, tid)
+            if user is None:
+                continue
 
-        prev = user.traffic_used_bytes
-        new = prev + delta
-        await asyncio.to_thread(repo.add_traffic, tid, delta)
-        await asyncio.to_thread(repo.log_connection, tid, delta, None)
+            prev = user.traffic_used_bytes
+            new = prev + delta
+            await asyncio.to_thread(repo.add_traffic, tid, delta)
+            await asyncio.to_thread(repo.log_connection, tid, delta, None)
 
-        limit_bytes = int(user.traffic_limit_gb * GB)
-        warn_at = limit_bytes - warn_bytes
+            limit_bytes = int(user.traffic_limit_gb * GB)
+            warn_at = limit_bytes - warn_bytes
 
-        # достиг лимита (пересёк в этом сэмпле) → блок новых подключений
-        if prev < limit_bytes <= new:
-            if user.vpn_client_id:
-                try:
-                    await asyncio.to_thread(
-                        vpn_client.delete_client, user.vpn_client_id, settings
-                    )
-                except vpn_client.VpnEngineError as e:
-                    log.error("блокировка по лимиту %s не удалась: %s", tid, e)
-            await asyncio.to_thread(
-                repo.audit, "traffic_limit_blocked", tid, {"used": new, "limit": limit_bytes}
-            )
-            await _notify(
-                bot, tid,
-                "🚫 Лимит трафика исчерпан. Доступ заблокирован до следующего "
-                "расчётного периода. /upgrade — больше трафика. Вы можете приобрести "
-                "платный тариф за 2.99$ в месяц.",
-            )
-        # остался ~предупредительный порог → одно уведомление за период
-        elif prev < warn_at <= new and not user.low_traffic_notified:
-            await asyncio.to_thread(repo.set_low_traffic_notified, tid, 1)
-            await _notify(
-                bot, tid,
-                f"⚠️ Осталось ~{settings.low_traffic_warning_mb:.0f}MB трафика. "
-                "По достижении лимита доступ заблокируется. /upgrade — продлить.",
-            )
+            # достиг лимита (пересёк в этом сэмпле) → блок новых подключений
+            if prev < limit_bytes <= new:
+                if user.vpn_client_id:
+                    try:
+                        await asyncio.to_thread(
+                            vpn_client.delete_client, user.vpn_client_id, settings
+                        )
+                    except vpn_client.VpnEngineError as e:
+                        log.error("блокировка по лимиту %s не удалась: %s", tid, e)
+                await asyncio.to_thread(
+                    repo.audit, "traffic_limit_blocked", tid, {"used": new, "limit": limit_bytes}
+                )
+                await _notify(
+                    bot, tid,
+                    "🚫 Лимит трафика исчерпан. Доступ заблокирован до следующего "
+                    "расчётного периода. /upgrade — больше трафика. Вы можете приобрести "
+                    "платный тариф за 2.99$ в месяц.",
+                )
+            # остался ~предупредительный порог → одно уведомление за период
+            elif prev < warn_at <= new and not user.low_traffic_notified:
+                await asyncio.to_thread(repo.set_low_traffic_notified, tid, 1)
+                await _notify(
+                    bot, tid,
+                    f"⚠️ Осталось ~{settings.low_traffic_warning_mb:.0f}MB трафика. "
+                    "По достижении лимита доступ заблокируется. /upgrade — продлить.",
+                )
+        except Exception:
+            log.exception("sample_traffic: сбой на email=%s, продолжаю со следующего", email)
 
 
 async def monthly_reset(bot: Bot, repo: Repository, settings: Settings) -> None:
